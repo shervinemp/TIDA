@@ -25,10 +25,15 @@ def patched_rope_forward(self, x, position_ids, seq_len=None, **kwargs):
     Patched forward for RoPE to handle float position_ids.
     Calculates cos/sin on the fly.
     """
-    if not hasattr(self, "inv_freq"):
+    if hasattr(self, "inv_freq"):
+        inv_freq = self.inv_freq
+    elif hasattr(self.config, "rope_theta"):
+        # Recompute inv_freq for models that don't buffer it
+        dim = x.shape[-1] // self.config.num_key_value_heads
+        inv_freq = 1.0 / (self.config.rope_theta ** (torch.arange(0, dim, 2).float().to(x.device) / dim))
+    else:
+        # Fallback: No scaling
         return x, x
-
-    inv_freq = self.inv_freq
 
     if inv_freq.device != x.device:
         inv_freq = inv_freq.to(x.device)
@@ -81,7 +86,7 @@ class TIDAModel(nn.Module):
 
             # Enable gradient checkpointing for VRAM efficiency as per spec
             if hasattr(self.base_model, "gradient_checkpointing_enable"):
-                 self.base_model.gradient_checkpointing_enable()
+                 self.base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -231,9 +236,8 @@ class TIDAModel(nn.Module):
         shift_labels = labels[..., 1:].contiguous()
 
         if torch.isnan(shift_logits).any():
-             print("NaN detected in shift_logits - likely mask or scale issue. Returning zero loss.")
-             # Return a dummy loss with grad
-             return torch.tensor(0.0, device=logits.device, requires_grad=True)
+             raise ValueError("NaN detected in shift_logits! This usually indicates instability. "
+                     "Try reducing learning_rate or checking your custom_mask logic.")
 
         loss_task = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),

@@ -6,12 +6,10 @@ def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=8):
     model.eval()
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.base_model.device)
 
-    # Batch size check
-    if input_ids.shape[0] > 1:
-        print("Warning: generate_tida currently supports adaptive inference for batch_size=1 only. Output might be incorrect for larger batches.")
-
     # 1. Pre-process prompt to get initial KV cache
     print(f"Generating for prompt: '{prompt}'")
+
+    batch_size = input_ids.shape[0]
 
     if input_ids.shape[1] > 1:
         context_ids = input_ids[:, :-1]
@@ -31,10 +29,10 @@ def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=8):
         # 1. Macro Step Initialization
         current_input = generated[:, -1:]
 
-        # Initialize Bucket State
-        t = 0.0
-        budget = 1.0
-        logit_sum = 0.0
+        # Initialize Bucket State (Vectorized)
+        t = torch.zeros(batch_size, 1, device=model.device, dtype=model.dtype)
+        budget = torch.ones(batch_size, 1, device=model.device, dtype=model.dtype)
+        logit_sum = torch.zeros(batch_size, 1, model.base_model.config.vocab_size, device=model.device, dtype=model.dtype)
 
         # Store kv from start of bucket
         bucket_start_kv = past_key_values
@@ -44,13 +42,17 @@ def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=8):
         for k in range(max_micro_k):
             # Calculate P_eff
             seq_len_so_far = generated.shape[1]
-            current_pos_ids = torch.tensor([[seq_len_so_far - 1 + t]], device=input_ids.device, dtype=model.dtype)
+
+            # current_pos_ids must be shape [batch_size, 1]
+            # t is [batch_size, 1], so we add (seq_len_so_far - 1) to it
+            current_pos_ids = (t + (seq_len_so_far - 1)).to(model.dtype)
 
             # Forward
             if k == 0:
                  embeds = model.base_model.get_input_embeddings()(current_input)
             else:
-                 embeds = model.blank_embedding
+                 # Expand blank embedding for batch
+                 embeds = model.blank_embedding.expand(batch_size, -1, -1)
 
             outputs = model.base_model(
                 inputs_embeds=embeds,
@@ -64,11 +66,15 @@ def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=8):
             last_hidden = outputs.hidden_states[-1]
             next_kv = outputs.past_key_values
 
-            # Physics
+            # Physics Update (Vectorized)
+            # time_head output is shape [B, 1, 1] (or [B, 1] depending on implementation, let's check)
+            # time_head uses MLP ending in Linear(..., 1), so [B, seq_len=1, 1]
             p = F.hardsigmoid(model.time_head(last_hidden))
+            p = p.squeeze(1) # [B, 1]
+
             delta = budget * p
-            t += delta.item()
-            budget -= delta.item()
+            t = t + delta
+            budget = budget - delta
 
             # Integration
             if hasattr(model.base_model, "lm_head"):
@@ -78,21 +84,21 @@ def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=8):
             else:
                  lm_head = model.base_model.model.lm_head
 
-            logits = lm_head(last_hidden)
+            logits = lm_head(last_hidden) # [B, 1, vocab]
 
-            weight = torch.exp(torch.tensor(t))
+            weight = torch.exp(t).unsqueeze(-1) # [B, 1, 1]
             logit_sum += logits * weight
 
             # Update loop variables
             current_bucket_kv = next_kv
 
-            # Early Exit
-            if p > 0.99:
+            # Vectorized Early Exit
+            if (p > 0.99).all():
                 break
 
         # Finalize Bucket
         next_token_logits = logit_sum[:, -1, :]
-        next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+        next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(1)
         generated = torch.cat([generated, next_token], dim=1)
 
         # Pruning: Truncate the KV cache to remove thought tokens

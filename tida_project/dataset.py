@@ -1,6 +1,7 @@
 from datasets import load_dataset
 from torch.utils.data import Dataset
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 class TIDADataset(Dataset):
     def __init__(self, tokenizer, data_path, max_length):
@@ -27,15 +28,15 @@ class TIDADataset(Dataset):
             text,
             truncation=True,
             max_length=self.max_length,
-            padding="max_length",
+            padding=False, # CHANGED: Do not pad here
             return_tensors="pt"
         )
 
         input_ids = encodings['input_ids'].squeeze(0)
         labels = input_ids.clone()
 
-        # Mask pad tokens in labels
-        labels[encodings['attention_mask'].squeeze(0) == 0] = -100
+        # No padding here, so no need to mask pad tokens yet.
+        # But we must ensure no partial padding exists from tokenizer (it shouldn't with padding=False)
 
         return {
             "input_ids": input_ids,
@@ -44,7 +45,13 @@ class TIDADataset(Dataset):
 
 def get_collate_fn(pad_token_id):
     def collate_fn(batch):
-        input_ids = torch.stack([item['input_ids'] for item in batch])
-        labels = torch.stack([item['labels'] for item in batch])
-        return input_ids, labels
+        # Extract inputs and labels
+        input_ids = [item['input_ids'] for item in batch]
+        labels = [item['labels'] for item in batch]
+
+        # Dynamic padding
+        input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id)
+        labels_padded = pad_sequence(labels, batch_first=True, padding_value=-100)
+
+        return input_ids_padded, labels_padded
     return collate_fn
