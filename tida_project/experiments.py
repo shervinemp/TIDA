@@ -86,6 +86,12 @@ EXPERIMENT_SUITE = [
         "preset": "tiny",
         "overrides": {"k_min": 2, "k_max": 6, "lambda_budget": 2.0},
     },
+    {
+        "name": "tida_rank32_k2-6_tiny",
+        "description": "Lower LoRA rank (r=32) for better generalization with limited data",
+        "preset": "tiny",
+        "overrides": {"k_min": 2, "k_max": 6, "lora_r": 32, "lora_alpha": 64},
+    },
 ]
 
 
