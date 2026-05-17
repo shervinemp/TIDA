@@ -310,11 +310,12 @@ def run_experiment(exp: dict, seed: int) -> dict:
 
     def eval_ppl(loader, name):
         import torch
+        from tqdm import tqdm
         model.eval()
         total = 0.0
         steps = 0
         with torch.no_grad():
-            for batch_inputs, batch_labels in loader:
+            for batch_inputs, batch_labels in tqdm(loader, desc=f"Eval {name}"):
                 loss = model(input_ids=batch_inputs, labels=batch_labels, k_steps=config.k_min)
                 total += loss.item()
                 steps += 1
@@ -344,9 +345,10 @@ def run_experiment(exp: dict, seed: int) -> dict:
         model.eval()
         total = 0
         correct = 0
+        from tqdm import tqdm
         with torch.no_grad():
             lambada_ds = load_dataset("lambada", split="test")
-            for item in lambada_ds:
+            for item in tqdm(lambada_ds, desc="Lambada"):
                 text = item["text"]
                 enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=config.max_seq_len)
                 input_ids = enc["input_ids"].to(device)

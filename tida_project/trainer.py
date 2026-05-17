@@ -2,6 +2,7 @@ import json
 import torch
 from accelerate import Accelerator
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from tqdm import tqdm
 import random
 import os
 
@@ -64,7 +65,8 @@ class TIDATrainer:
             if self.accelerator.is_local_main_process:
                 print(f"Starting Epoch {epoch}")
 
-            for step, (batch_inputs, batch_labels) in enumerate(self.loader):
+            pbar = tqdm(self.loader, desc=f"Epoch {epoch}", disable=not self.accelerator.is_local_main_process)
+            for step, (batch_inputs, batch_labels) in enumerate(pbar):
                 global_step = epoch * len(self.loader) + step
                 with self.accelerator.accumulate(self.model):
                     k_step = self.curriculum_k(global_step, total_steps)
@@ -77,7 +79,6 @@ class TIDATrainer:
                         lambda_budget=current_lambda,
                     )
 
-                    # Backward
                     self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -86,8 +87,7 @@ class TIDATrainer:
                     if self.accelerator.sync_gradients:
                         self.scheduler.step()
 
-                    if step % 10 == 0 and self.accelerator.is_local_main_process:
-                        print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f} | K: {k_step}")
+                pbar.set_postfix(loss=f"{loss.item():.3f}", K=k_step)
 
             if self.val_loader is not None:
                 self.validate(epoch)
@@ -98,10 +98,11 @@ class TIDATrainer:
 
     def validate(self, epoch):
         self.model.eval()
-        total_loss = 0
+        total_loss = 0.0
         steps = 0
+        pbar = tqdm(self.val_loader, desc=f"Val {epoch}", disable=not self.accelerator.is_local_main_process)
         with torch.no_grad():
-            for batch_inputs, batch_labels in self.val_loader:
+            for batch_inputs, batch_labels in pbar:
                 k_step = self.config.k_min
                 loss = self.model(input_ids=batch_inputs, labels=batch_labels, k_steps=k_step)
                 total_loss += loss.item()
