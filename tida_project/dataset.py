@@ -1,3 +1,4 @@
+import logging
 import os
 from datasets import load_dataset
 from torch.utils.data import Dataset
@@ -5,52 +6,54 @@ import torch
 
 class TIDADataset(Dataset):
     def __init__(self, tokenizer, data_source, max_length, split="train", text_key="text"):
-        self.text_key = text_key
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.pad_token_id = tokenizer.pad_token_id or 0
+
         if data_source == "wikitext":
-            self.data = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+            raw = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
         elif os.path.isfile(data_source):
             ext = os.path.splitext(data_source)[1].lower()
             if ext in (".json", ".jsonl"):
-                self.data = load_dataset("json", data_files=data_source, split=split)
+                raw = load_dataset("json", data_files=data_source, split=split)
             elif ext == ".csv":
-                self.data = load_dataset("csv", data_files=data_source, split=split)
+                raw = load_dataset("csv", data_files=data_source, split=split)
             else:
-                self.data = load_dataset("text", data_files=data_source, split=split)
+                raw = load_dataset("text", data_files=data_source, split=split)
         else:
-            self.data = load_dataset(data_source, split=split)
+            raw = load_dataset(data_source, split=split)
 
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+        # Filter: skip empty lines and wiki markup headers
+        texts = [
+            item[text_key] for item in raw
+            if item.get(text_key) and not item[text_key].startswith(" =")
+        ]
+        if not texts:
+            texts = [" "]
+
+        sep = tokenizer.eos_token or ""
+        full = sep.join(texts)
+
+        logging.getLogger("transformers.tokenization_utils").setLevel(logging.ERROR)
+        token_ids = tokenizer(full, truncation=False, return_tensors="pt")["input_ids"][0]
+
+        chunks = torch.split(token_ids, max_length)
+        self.examples = []
+        for c in chunks:
+            if c.numel() < max_length:
+                pad = torch.full((max_length - c.numel(),), self.pad_token_id, dtype=c.dtype)
+                c = torch.cat([c, pad])
+            self.examples.append(c)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.examples)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        if self.text_key in item:
-            text = item[self.text_key]
-        else:
-            text = item[list(item.keys())[0]]
-        if not text:
-            text = " "
-
-        encodings = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt"
-        )
-
-        input_ids = encodings['input_ids'].squeeze(0)
+        input_ids = self.examples[idx].clone()
         labels = input_ids.clone()
+        labels[labels == self.pad_token_id] = -100
+        return {"input_ids": input_ids, "labels": labels}
 
-        labels[encodings['attention_mask'].squeeze(0) == 0] = -100
-
-        return {
-            "input_ids": input_ids,
-            "labels": labels
-        }
 
 def get_collate_fn(pad_token_id):
     def collate_fn(batch):

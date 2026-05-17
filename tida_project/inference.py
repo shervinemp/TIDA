@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 
 @torch.no_grad()
 def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=6):
@@ -43,9 +42,14 @@ def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=6):
 
         # Micro Loop
         for k in range(max_micro_k):
-            # Calculate P_eff
             seq_len_so_far = generated.shape[1]
-            current_pos_ids = torch.tensor([[seq_len_so_far - 1 + t]], device=device, dtype=torch.float32)
+            if model.config.fractional_positions:
+                pos_dtype = torch.float32
+                pos_offset = t
+            else:
+                pos_dtype = torch.long
+                pos_offset = float(k)
+            current_pos_ids = torch.tensor([[seq_len_so_far - 1 + pos_offset]], device=device, dtype=pos_dtype)
 
             # Forward
             if k == 0:
@@ -57,14 +61,14 @@ def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=6):
                 inputs_embeds=embeds,
                 position_ids=current_pos_ids,
                 past_key_values=current_bucket_kv,
-                use_cache=True
+                use_cache=True,
+                output_hidden_states=True
             )
 
-            last_hidden = outputs.last_hidden_state
+            last_hidden = outputs.hidden_states[-1]
             next_kv = outputs.past_key_values
 
-            # Physics
-            p = F.hardsigmoid(model.time_head(last_hidden))
+            p = model.time_head(last_hidden)
             delta = budget * p
             t += delta.item()
             budget -= delta.item()

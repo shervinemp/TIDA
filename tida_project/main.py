@@ -1,30 +1,25 @@
-from config import TIDAConfig
+import argparse
+from config import TIDAConfig, load_config, MODEL_PRESETS
 from modeling_tida import TIDAModel
 from dataset import TIDADataset, get_collate_fn
 from trainer import TIDATrainer
 from inference import generate_tida
 from transformers import AutoTokenizer
 import torch
-import sys
 import os
 
 def main():
-    config = TIDAConfig()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", choices=list(MODEL_PRESETS), default="tiny", help="Model preset")
+    parser.add_argument("--verify", action="store_true", help="Alias for --model verify")
+    args = parser.parse_args()
 
-    is_verify = len(sys.argv) > 1 and sys.argv[1] == "--verify"
+    preset = "verify" if args.verify else args.model
+    config = load_config(preset)
 
-    # Enable anomaly detection (slows training, used for debugging)
-    if is_verify:
+    if preset == "verify":
         torch.autograd.set_detect_anomaly(True)
-
-    # 1. Setup
-    if is_verify:
         print("Running in verification mode with tiny model...")
-        config.base_model_name = "HuggingFaceTB/SmolLM-135M"
-        config.batch_size = 1
-        config.max_seq_len = 32
-        config.num_epochs = 1
-        config.gradient_accumulation_steps = 1
 
     data_path = "wikitext"
 
@@ -42,11 +37,10 @@ def main():
     else:
         val_dataset = None
 
-    # Subset for verification
-    if is_verify:
-        train_dataset.data = train_dataset.data.select(range(10))
+    if preset == "verify":
+        train_dataset.examples = train_dataset.examples[:10]
         if val_dataset is not None:
-            val_dataset.data = val_dataset.data.select(range(5))
+            val_dataset.examples = val_dataset.examples[:5]
 
     collate_fn = get_collate_fn(tokenizer.pad_token_id)
     train_loader = torch.utils.data.DataLoader(
@@ -77,17 +71,16 @@ def main():
 
     # 5. Inference Demonstration
     print("\n--- Inference Demonstration ---")
-    if is_verify:
+    if preset == "verify":
         prompt = "Once upon a time"
     else:
         prompt = "The future of AI is"
 
-    generated_text = generate_tida(model, tokenizer, prompt, max_new_tokens=10 if is_verify else 30)
+    generated_text = generate_tida(model, tokenizer, prompt, max_new_tokens=10 if preset == "verify" else 30)
     print(f"Prompt: {prompt}")
     print(f"Generated: {generated_text}")
 
-    # 6. Test Loading
-    if is_verify:
+    if preset == "verify":
         print("\n--- Testing Model Loading ---")
         last_epoch = config.num_epochs - 1
         checkpoint_dir = f"./checkpoints/epoch_{last_epoch}"

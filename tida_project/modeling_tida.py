@@ -1,3 +1,4 @@
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -66,7 +67,7 @@ class TIDAModel(nn.Module):
             # Force eager attention to avoid issues with custom masks and FA2 on CPU/Verification
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 config.base_model_name,
-                torch_dtype=self.dtype,
+                dtype=self.dtype,
                 attn_implementation="eager"
             )
 
@@ -84,27 +85,46 @@ class TIDAModel(nn.Module):
                  self.base_model.gradient_checkpointing_enable()
 
         if hasattr(self.base_model, "get_base_model"):
-             base_config = self.base_model.get_base_model().config
+             underlying = self.base_model.get_base_model()
+             base_config = underlying.config
         elif hasattr(self.base_model, "config"):
-             base_config = self.base_model.config
+             underlying = self.base_model
+             base_config = underlying.config
         else:
-             base_config = self.base_model.base_model.config
+             underlying = self.base_model.base_model
+             base_config = underlying.config
 
         self.hidden_size = base_config.hidden_size
+
+        # Locate the transformer backbone (without LM head) so we can access last_hidden_state
+        self.backbone = getattr(underlying, 'model', None) or getattr(underlying, 'transformer', None)
+        if self.backbone is None:
+            print("Warning: Could not find transformer backbone — falling back to output_hidden_states=True")
 
         # Zero-init for stable start; model learns thought embeddings
         self.blank_embedding = nn.Parameter(torch.zeros(1, config.k_max, self.hidden_size, dtype=self.dtype, device=self.device))
         self.time_head = TIDATimeHead(self.hidden_size).to(dtype=self.dtype, device=self.device)
 
-        apply_rope_patch(self.base_model)
+        if config.fractional_positions:
+            apply_rope_patch(self.base_model)
 
     @classmethod
     def from_pretrained(cls, config, checkpoint_dir):
         print(f"Loading TIDA model from {checkpoint_dir}")
 
+        # Restore config metadata saved during training
+        meta_path = os.path.join(checkpoint_dir, "config_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            for k, v in meta.items():
+                if hasattr(config, k):
+                    setattr(config, k, v)
+                    print(f"  Restored config.{k} = {v}")
+
         base_model = AutoModelForCausalLM.from_pretrained(
             config.base_model_name,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
+            dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
             attn_implementation="eager"
         )
 
@@ -116,6 +136,10 @@ class TIDAModel(nn.Module):
 
         instance = cls(config, base_model_instance=base_model)
 
+        # Re-enable gradient checkpointing (not applied in __init__ when base_model_instance is given)
+        if hasattr(instance.base_model, "gradient_checkpointing_enable"):
+            instance.base_model.gradient_checkpointing_enable()
+
         time_head_path = os.path.join(checkpoint_dir, "time_head.pt")
         if os.path.exists(time_head_path):
             instance.time_head.load_state_dict(torch.load(time_head_path, map_location=instance.device, weights_only=True))
@@ -123,14 +147,20 @@ class TIDAModel(nn.Module):
         blank_emb_path = os.path.join(checkpoint_dir, "blank_emb.pt")
         if os.path.exists(blank_emb_path):
              loaded_emb = torch.load(blank_emb_path, map_location=instance.device, weights_only=True)
-             if loaded_emb.shape[-2] == 1 and instance.blank_embedding.shape[-2] > 1:
+             saved_k = loaded_emb.shape[-2]
+             model_k = instance.blank_embedding.shape[-2]
+             if saved_k == model_k:
+                 instance.blank_embedding.data = loaded_emb.data
+             elif saved_k == 1 and model_k > 1:
                  instance.blank_embedding.data[:, 0:1, :] = loaded_emb.data
              else:
-                 instance.blank_embedding.data = loaded_emb.data
+                 n = min(saved_k, model_k)
+                 instance.blank_embedding.data[:, :n, :] = loaded_emb.data[:, :n, :]
+                 print(f"  Resized blank_embedding: saved {saved_k} → model {model_k}")
 
         return instance
 
-    def forward(self, input_ids, attention_mask=None, labels=None, k_steps=None):
+    def forward(self, input_ids, attention_mask=None, labels=None, k_steps=None, lambda_budget=None):
         batch_size, seq_len = input_ids.shape
         K = k_steps if k_steps is not None else self.config.k_min
 
@@ -141,10 +171,15 @@ class TIDAModel(nn.Module):
         combined_embeds = torch.cat([inputs_embeds.unsqueeze(2), blank_embeds], dim=2)
         combined_embeds = combined_embeds.view(batch_size, seq_len * (K + 1), -1)
 
-        # --- B. Physics Calculation ---
-        micro_positions = torch.linspace(0, 0.99, K+1, device=inputs_embeds.device, dtype=torch.float32)
-        macro_positions = torch.arange(seq_len, device=inputs_embeds.device, dtype=torch.float32).unsqueeze(1)
-        position_ids = (macro_positions + micro_positions).view(1, -1).expand(batch_size, -1)
+        # --- B. Position Calculation ---
+        macro_positions = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(1)
+        if self.config.fractional_positions:
+            micro_positions = torch.linspace(0, 0.99, K+1, device=inputs_embeds.device, dtype=torch.float32)
+            macro_f = macro_positions.float()
+            position_ids = (macro_f + micro_positions).view(1, -1).expand(batch_size, -1)
+        else:
+            micro_positions = torch.arange(K+1, device=inputs_embeds.device)
+            position_ids = (macro_positions * (K + 1) + micro_positions).view(1, -1).expand(batch_size, -1)
 
         # --- Create Custom Attention Mask (Staircase) ---
         total_len = seq_len * (K + 1)
@@ -174,53 +209,67 @@ class TIDAModel(nn.Module):
         custom_mask = torch.where(mask_expanded, torch.tensor(0.0, dtype=self.dtype, device=self.device), custom_mask)
 
         # --- C. Transformer Pass ---
-        outputs = self.base_model(
-            inputs_embeds=combined_embeds,
-            position_ids=position_ids,
-            attention_mask=custom_mask,
-            use_cache=False
-        )
+        if self.backbone is not None:
+            backbone_out = self.backbone(
+                inputs_embeds=combined_embeds,
+                position_ids=position_ids,
+                attention_mask=custom_mask,
+                use_cache=False,
+            )
+            last_hidden = backbone_out.last_hidden_state
+            logits = self.base_model.get_output_embeddings()(last_hidden)
+        else:
+            outputs = self.base_model(
+                inputs_embeds=combined_embeds,
+                position_ids=position_ids,
+                attention_mask=custom_mask,
+                use_cache=False,
+                output_hidden_states=True,
+            )
+            logits = outputs.logits
+            last_hidden = outputs.hidden_states[-1]
 
-        logits = outputs.logits
-        last_hidden = outputs.last_hidden_state
         p_vals = self.time_head(last_hidden)
 
         # --- D. Integral Logic & Loss ---
         if labels is not None:
-            return self.compute_loss(logits, p_vals, labels, K, seq_len)
+            total_loss, integrated_logits = self.compute_loss(logits, p_vals, labels, K, seq_len, lambda_budget=lambda_budget)
+
+            # KL regularization: keep TIDA output close to the model's own K=0 output
+            if self.config.lambda_kl > 0 and K > 0:
+                with torch.no_grad():
+                    ref = self.forward(input_ids, labels=None, k_steps=0)
+                log_p = F.log_softmax(integrated_logits, dim=-1)
+                p_ref = F.softmax(ref, dim=-1)
+                kl = F.kl_div(log_p, p_ref, reduction='batchmean')
+                total_loss = total_loss + self.config.lambda_kl * kl
+
+            return total_loss
 
         return logits
 
-    def compute_loss(self, logits, p_vals, labels, K, seq_len):
+    def compute_loss(self, logits, p_vals, labels, K, seq_len, lambda_budget=None):
         batch_size = logits.shape[0]
 
         logits = logits.view(batch_size, seq_len, K+1, -1)
         p_vals = p_vals.view(batch_size, seq_len, K+1)
 
-        # t_accum stores [t_0, t_1, ... t_K]
-        # Boundary Condition: t_0 = 0.0
         t_accum = torch.zeros(batch_size, seq_len, K+1, device=logits.device, dtype=logits.dtype)
         b_rem = torch.ones(batch_size, seq_len, device=logits.device, dtype=logits.dtype)
         current_t = torch.zeros(batch_size, seq_len, device=logits.device, dtype=logits.dtype)
 
-        # Calculate t_{k+1} based on p_k. t_0 is already 0.0.
-        # Loop K times to fill indices 1..K
         for k in range(K):
             p_k = p_vals[:, :, k]
             delta = b_rem * p_k
             current_t = current_t + delta
             b_rem = b_rem - delta
-
-            # Update next step
             t_accum[:, :, k+1] = current_t
 
         weights = torch.exp(t_accum).unsqueeze(-1)
-
         integrated_logits = torch.sum(logits * weights, dim=2)
 
         shift_logits = integrated_logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-
         shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
 
         loss_task = F.cross_entropy(
@@ -228,8 +277,12 @@ class TIDAModel(nn.Module):
             shift_labels.view(-1)
         )
 
-        final_t = t_accum[:, :, -1]
-        loss_budget = torch.mean((1.0 - final_t) ** 2)
+        if K > 0:
+            final_t = t_accum[:, :, -1]
+            loss_budget = torch.mean((1.0 - final_t) ** 2)
+            lb = lambda_budget if lambda_budget is not None else self.config.lambda_budget
+            total_loss = loss_task + lb * loss_budget
+        else:
+            total_loss = loss_task
 
-        total_loss = loss_task + self.config.lambda_budget * loss_budget
-        return total_loss
+        return total_loss, integrated_logits
