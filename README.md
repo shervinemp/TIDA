@@ -144,7 +144,7 @@ Loading automatically restores the config metadata so checkpoints are self-descr
 | `tida_integer_pos` | tiny | Integer positions vs fractional |
 | `tida_nobudget` | tiny | No budget loss (λ=0) |
 | `tida_lambda_0.1` | tiny | Weak budget pressure |
-| `tida_lambda_2.0` | tiny | Strong budget pressure |
+| `tida_rank32` | tiny | Lower LoRA rank (r=32) for limited data |
 
 Each measures: validation/test perplexity, Lambada accuracy, adaptivity (steps/token, budget used), training time, and FLOPs.
 
