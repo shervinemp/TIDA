@@ -2,13 +2,14 @@ import torch
 import torch.nn.functional as F
 
 @torch.no_grad()
-def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=8):
+def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=6):
     model.eval()
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.base_model.device)
+    device = next(model.parameters()).device
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
-    # Batch size check
     if input_ids.shape[0] > 1:
-        print("Warning: generate_tida currently supports adaptive inference for batch_size=1 only. Output might be incorrect for larger batches.")
+        import warnings
+        warnings.warn("generate_tida currently supports batch_size=1 only.", stacklevel=2)
 
     # 1. Pre-process prompt to get initial KV cache
     print(f"Generating for prompt: '{prompt}'")
@@ -34,7 +35,7 @@ def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=8):
         # Initialize Bucket State
         t = 0.0
         budget = 1.0
-        logit_sum = 0.0
+        logit_sum = None
 
         # Store kv from start of bucket
         bucket_start_kv = past_key_values
@@ -44,24 +45,22 @@ def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=8):
         for k in range(max_micro_k):
             # Calculate P_eff
             seq_len_so_far = generated.shape[1]
-            current_pos_ids = torch.tensor([[seq_len_so_far - 1 + t]], device=input_ids.device, dtype=model.dtype)
+            current_pos_ids = torch.tensor([[seq_len_so_far - 1 + t]], device=device, dtype=torch.float32)
 
             # Forward
             if k == 0:
                  embeds = model.base_model.get_input_embeddings()(current_input)
             else:
-                 embeds = model.blank_embedding
+                 embeds = model.blank_embedding[:, k-1:k, :]
 
             outputs = model.base_model(
                 inputs_embeds=embeds,
                 position_ids=current_pos_ids,
                 past_key_values=current_bucket_kv,
-                use_cache=True,
-                output_hidden_states=True
+                use_cache=True
             )
 
-            # Extract outputs
-            last_hidden = outputs.hidden_states[-1]
+            last_hidden = outputs.last_hidden_state
             next_kv = outputs.past_key_values
 
             # Physics
@@ -70,18 +69,13 @@ def generate_tida(model, tokenizer, prompt, max_new_tokens=50, max_micro_k=8):
             t += delta.item()
             budget -= delta.item()
 
-            # Integration
-            if hasattr(model.base_model, "lm_head"):
-                 lm_head = model.base_model.lm_head
-            elif hasattr(model.base_model, "base_model") and hasattr(model.base_model.base_model, "lm_head"):
-                 lm_head = model.base_model.base_model.lm_head
+            logits = model.base_model.get_output_embeddings()(last_hidden)
+
+            weight = torch.exp(torch.tensor(t, device=logits.device))
+            if logit_sum is None:
+                logit_sum = logits * weight
             else:
-                 lm_head = model.base_model.model.lm_head
-
-            logits = lm_head(last_hidden)
-
-            weight = torch.exp(torch.tensor(t))
-            logit_sum += logits * weight
+                logit_sum += logits * weight
 
             # Update loop variables
             current_bucket_kv = next_kv

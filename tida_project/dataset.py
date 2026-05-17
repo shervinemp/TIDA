@@ -1,15 +1,23 @@
+import os
 from datasets import load_dataset
 from torch.utils.data import Dataset
 import torch
 
 class TIDADataset(Dataset):
-    def __init__(self, tokenizer, data_path, max_length):
-        # Using a small subset for verification purposes if needed, but standard logic follows
-        # We handle "wikitext" specifically or generic file
-        if data_path == "wikitext":
-             self.data = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    def __init__(self, tokenizer, data_source, max_length, split="train", text_key="text"):
+        self.text_key = text_key
+        if data_source == "wikitext":
+            self.data = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+        elif os.path.isfile(data_source):
+            ext = os.path.splitext(data_source)[1].lower()
+            if ext in (".json", ".jsonl"):
+                self.data = load_dataset("json", data_files=data_source, split=split)
+            elif ext == ".csv":
+                self.data = load_dataset("csv", data_files=data_source, split=split)
+            else:
+                self.data = load_dataset("text", data_files=data_source, split=split)
         else:
-             self.data = load_dataset(data_path, split="train")
+            self.data = load_dataset(data_source, split=split)
 
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -18,10 +26,13 @@ class TIDADataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        text = self.data[idx]['text'] # Adjust key based on dataset
+        item = self.data[idx]
+        if self.text_key in item:
+            text = item[self.text_key]
+        else:
+            text = item[list(item.keys())[0]]
         if not text:
-             # Handle empty strings in wikitext
-             text = " "
+            text = " "
 
         encodings = self.tokenizer(
             text,
@@ -34,7 +45,6 @@ class TIDADataset(Dataset):
         input_ids = encodings['input_ids'].squeeze(0)
         labels = input_ids.clone()
 
-        # Mask pad tokens in labels
         labels[encodings['attention_mask'].squeeze(0) == 0] = -100
 
         return {

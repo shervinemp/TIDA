@@ -2,12 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel
-from transformers import AutoModelForCausalLM, AutoConfig
+from transformers import AutoModelForCausalLM
 import types
 import os
 
 class TIDATimeHead(nn.Module):
-    """Predicts consumption fraction p_k."""
     def __init__(self, hidden_size):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -17,14 +16,9 @@ class TIDATimeHead(nn.Module):
         )
 
     def forward(self, hidden_states):
-        # HardSigmoid: max(0, min(1, (x+3)/6))
         return F.hardsigmoid(self.mlp(hidden_states))
 
 def patched_rope_forward(self, x, position_ids, seq_len=None, **kwargs):
-    """
-    Patched forward for RoPE to handle float position_ids.
-    Calculates cos/sin on the fly.
-    """
     if not hasattr(self, "inv_freq"):
         return x, x
 
@@ -49,9 +43,6 @@ def patched_rope_forward(self, x, position_ids, seq_len=None, **kwargs):
     return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 def apply_rope_patch(model):
-    """
-    Monkey-patch the base model's RoPE.
-    """
     patched = False
     for name, module in model.named_modules():
         if "RotaryEmbedding" in module.__class__.__name__:
@@ -79,10 +70,6 @@ class TIDAModel(nn.Module):
                 attn_implementation="eager"
             )
 
-            # Enable gradient checkpointing for VRAM efficiency as per spec
-            if hasattr(self.base_model, "gradient_checkpointing_enable"):
-                 self.base_model.gradient_checkpointing_enable()
-
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 r=config.lora_r,
@@ -91,6 +78,10 @@ class TIDAModel(nn.Module):
                 target_modules=config.target_modules
             )
             self.base_model = get_peft_model(self.base_model, peft_config)
+
+            # Enable gradient checkpointing for VRAM efficiency
+            if hasattr(self.base_model, "gradient_checkpointing_enable"):
+                 self.base_model.gradient_checkpointing_enable()
 
         if hasattr(self.base_model, "get_base_model"):
              base_config = self.base_model.get_base_model().config
@@ -101,8 +92,8 @@ class TIDAModel(nn.Module):
 
         self.hidden_size = base_config.hidden_size
 
-        # Use smaller initialization for stability
-        self.blank_embedding = nn.Parameter(torch.randn(1, 1, self.hidden_size, dtype=self.dtype, device=self.device) * 0.02)
+        # Zero-init for stable start; model learns thought embeddings
+        self.blank_embedding = nn.Parameter(torch.zeros(1, config.k_max, self.hidden_size, dtype=self.dtype, device=self.device))
         self.time_head = TIDATimeHead(self.hidden_size).to(dtype=self.dtype, device=self.device)
 
         apply_rope_patch(self.base_model)
@@ -127,32 +118,32 @@ class TIDAModel(nn.Module):
 
         time_head_path = os.path.join(checkpoint_dir, "time_head.pt")
         if os.path.exists(time_head_path):
-            instance.time_head.load_state_dict(torch.load(time_head_path, map_location=instance.device))
+            instance.time_head.load_state_dict(torch.load(time_head_path, map_location=instance.device, weights_only=True))
 
         blank_emb_path = os.path.join(checkpoint_dir, "blank_emb.pt")
         if os.path.exists(blank_emb_path):
-             loaded_emb = torch.load(blank_emb_path, map_location=instance.device)
-             instance.blank_embedding.data = loaded_emb.data
+             loaded_emb = torch.load(blank_emb_path, map_location=instance.device, weights_only=True)
+             if loaded_emb.shape[-2] == 1 and instance.blank_embedding.shape[-2] > 1:
+                 instance.blank_embedding.data[:, 0:1, :] = loaded_emb.data
+             else:
+                 instance.blank_embedding.data = loaded_emb.data
 
         return instance
 
     def forward(self, input_ids, attention_mask=None, labels=None, k_steps=None):
-        """
-        Parallel Training Forward Pass.
-        """
         batch_size, seq_len = input_ids.shape
-        K = k_steps if k_steps else self.config.k_min
+        K = k_steps if k_steps is not None else self.config.k_min
 
         # --- A. Embeddings & Expansion ---
         inputs_embeds = self.base_model.get_input_embeddings()(input_ids)
-        blank_embeds = self.blank_embedding.expand(batch_size, seq_len, K, -1)
+        blank_embeds = self.blank_embedding[:, :K, :].unsqueeze(1).expand(batch_size, seq_len, K, -1)
 
         combined_embeds = torch.cat([inputs_embeds.unsqueeze(2), blank_embeds], dim=2)
         combined_embeds = combined_embeds.view(batch_size, seq_len * (K + 1), -1)
 
         # --- B. Physics Calculation ---
-        micro_positions = torch.linspace(0, 0.99, K+1, device=inputs_embeds.device, dtype=self.dtype)
-        macro_positions = torch.arange(seq_len, device=inputs_embeds.device, dtype=self.dtype).unsqueeze(1)
+        micro_positions = torch.linspace(0, 0.99, K+1, device=inputs_embeds.device, dtype=torch.float32)
+        macro_positions = torch.arange(seq_len, device=inputs_embeds.device, dtype=torch.float32).unsqueeze(1)
         position_ids = (macro_positions + micro_positions).view(1, -1).expand(batch_size, -1)
 
         # --- Create Custom Attention Mask (Staircase) ---
@@ -187,11 +178,11 @@ class TIDAModel(nn.Module):
             inputs_embeds=combined_embeds,
             position_ids=position_ids,
             attention_mask=custom_mask,
-            output_hidden_states=True
+            use_cache=False
         )
 
         logits = outputs.logits
-        last_hidden = outputs.hidden_states[-1]
+        last_hidden = outputs.last_hidden_state
         p_vals = self.time_head(last_hidden)
 
         # --- D. Integral Logic & Loss ---
@@ -230,10 +221,7 @@ class TIDAModel(nn.Module):
         shift_logits = integrated_logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
-        if torch.isnan(shift_logits).any():
-             print("NaN detected in shift_logits - likely mask or scale issue. Returning zero loss.")
-             # Return a dummy loss with grad
-             return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
 
         loss_task = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
