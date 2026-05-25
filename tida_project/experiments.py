@@ -26,6 +26,23 @@ RESULTS_FILE = RESULTS_DIR / "experiments.json"
 INFERENCE_DIR = RESULTS_DIR / "samples"
 INFERENCE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def find_latest_checkpoint(run_name):
+    base_dir = f"./checkpoints/{run_name}"
+    if not os.path.exists(base_dir):
+        return None
+    ckpts = []
+    for d in os.listdir(base_dir):
+        if d.startswith("epoch_"):
+            try:
+                ep = int(d.split("_")[-1])
+                ckpts.append((ep, os.path.join(base_dir, d)))
+            except ValueError:
+                pass
+    if not ckpts:
+        return None
+    return max(ckpts, key=lambda x: x[0])[1]
+
 MODELS = ["tiny", "small", "medium"]
 
 # ---------------------------------------------------------------------------
@@ -161,34 +178,43 @@ def analyze_adaptivity(model, tokenizer, config, device, prompts, max_micro_k=No
             bucket_start_kv = past_kv
             current_bucket_kv = bucket_start_kv
 
-            for k in range(max_micro_k):
-                seq_len_so_far = generated.shape[1]
-                if config.fractional_positions:
-                    pos_ids = torch.tensor([[seq_len_so_far - 1 + t]], device=device, dtype=torch.float32)
-                else:
-                    pos_ids = torch.tensor([[seq_len_so_far - 1 + k]], device=device, dtype=torch.long)
-                embeds = (
-                    model.base_model.get_input_embeddings()(current_input)
-                    if k == 0
-                    else model.blank_embedding[:, k - 1 : k, :]
-                )
+            if max_micro_k == 0:
                 out = model.base_model(
-                    inputs_embeds=embeds,
-                    position_ids=pos_ids,
+                    input_ids=current_input,
                     past_key_values=current_bucket_kv,
                     use_cache=True,
                     output_hidden_states=True,
                 )
-                p = model.time_head(out.hidden_states[-1])
-                delta = budget * p
-                t = t + delta.item()
-                budget = budget - delta.item()
-                current_bucket_kv = out.past_key_values
-                if p > 0.99:
-                    steps.append(k + 1)
-                    break
+                steps.append(0)
             else:
-                steps.append(max_micro_k)
+                for k in range(max_micro_k):
+                    seq_len_so_far = generated.shape[1]
+                    if config.fractional_positions:
+                        pos_ids = torch.tensor([[seq_len_so_far - 1 + t]], device=device, dtype=torch.float32)
+                    else:
+                        pos_ids = torch.tensor([[seq_len_so_far - 1 + k]], device=device, dtype=torch.long)
+                    embeds = (
+                        model.base_model.get_input_embeddings()(current_input)
+                        if k == 0
+                        else model.blank_embedding[:, k - 1 : k, :]
+                    )
+                    out = model.base_model(
+                        inputs_embeds=embeds,
+                        position_ids=pos_ids,
+                        past_key_values=current_bucket_kv,
+                        use_cache=True,
+                        output_hidden_states=True,
+                    )
+                    p = model.time_head(out.hidden_states[-1])
+                    delta = budget * p
+                    t = t + delta.item()
+                    budget = budget - delta.item()
+                    current_bucket_kv = out.past_key_values
+                    if p > 0.99:
+                        steps.append(k + 1)
+                        break
+                else:
+                    steps.append(max_micro_k)
 
             budgets.append(1.0 - budget)
             times.append(t)
@@ -226,7 +252,7 @@ def seed_worker(worker_id):
     random.seed(worker_id)
 
 
-def run_experiment(exp: dict, seed: int) -> dict:
+def run_experiment(exp: dict, seed: int, force: bool = False) -> dict:
     import torch
     import random
     import numpy as np
@@ -241,6 +267,7 @@ def run_experiment(exp: dict, seed: int) -> dict:
 
     name = exp["name"]
     preset = exp.get("preset", "tiny")
+    run_name = f"{name}_seed{seed}"
     print(f"\n{'='*60}")
     print(f"Experiment: {name}  |  seed: {seed}")
     print(f"  {exp.get('description', '')}")
@@ -278,6 +305,22 @@ def run_experiment(exp: dict, seed: int) -> dict:
         worker_init_fn=seed_worker,
     )
 
+    # Check for existing checkpoint to resume (unless --force)
+    latest_ckpt = None if force else find_latest_checkpoint(run_name)
+    resume_epoch = 0
+    if latest_ckpt is not None:
+        print(f"Resuming from checkpoint: {latest_ckpt}")
+        # Load training state to determine resume epoch
+        state_path = os.path.join(latest_ckpt, "training_state.json")
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                state = json.load(f)
+            resume_epoch = state.get("epoch", -1) + 1
+            if resume_epoch >= config.num_epochs:
+                print(f"  All epochs completed, skipping.")
+    else:
+        print("Initializing model from scratch...")
+
     print("Initializing model...")
     if shared_emb:
         model = TIDAModel(config)
@@ -297,9 +340,16 @@ def run_experiment(exp: dict, seed: int) -> dict:
     print("Starting training...")
     start = time.time()
 
-    # Wrap model blank embeddings before training if using shared_emb
-    trainer = TIDATrainer(model, train_loader, config, tokenizer, val_loader=val_loader)
-    trainer.train()
+    trainer = TIDATrainer(model, train_loader, config, tokenizer, val_loader=val_loader, run_name=run_name)
+
+    # If resuming, load model weights + optimizer + scheduler from checkpoint
+    if latest_ckpt is not None:
+        trainer.load_checkpoint(latest_ckpt)
+
+    if resume_epoch < config.num_epochs:
+        trainer.train(resume_epoch=resume_epoch)
+    else:
+        print("  All epochs already completed, skipping training.")
     elapsed = time.time() - start
 
     device = next(model.parameters()).device
@@ -316,6 +366,8 @@ def run_experiment(exp: dict, seed: int) -> dict:
         steps = 0
         with torch.no_grad():
             for batch_inputs, batch_labels in tqdm(loader, desc=f"Eval {name}"):
+                batch_inputs = batch_inputs.to(device)
+                batch_labels = batch_labels.to(device)
                 loss = model(input_ids=batch_inputs, labels=batch_labels, k_steps=config.k_min)
                 total += loss.item()
                 steps += 1
@@ -394,7 +446,7 @@ def run_experiment(exp: dict, seed: int) -> dict:
 
     # Clean up intermediate checkpoints — keep only the final epoch
     for ep in range(config.num_epochs - 1):
-        ckpt = f"./checkpoints/epoch_{ep}"
+        ckpt = f"./checkpoints/{run_name}/epoch_{ep}"
         if os.path.exists(ckpt):
             shutil.rmtree(ckpt, ignore_errors=True)
 
@@ -491,7 +543,7 @@ def main():
                 continue
 
             try:
-                metrics = run_experiment(exp, seed)
+                metrics = run_experiment(exp, seed, force=args.force)
                 existing[seed_key] = {**exp, **metrics}
                 save_results(existing)
             except Exception as e:
