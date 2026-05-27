@@ -252,7 +252,7 @@ def seed_worker(worker_id):
     random.seed(worker_id)
 
 
-def run_experiment(exp: dict, seed: int, force: bool = False) -> dict:
+def run_experiment(exp: dict, seed: int) -> dict:
     import torch
     import random
     import numpy as np
@@ -305,8 +305,8 @@ def run_experiment(exp: dict, seed: int, force: bool = False) -> dict:
         worker_init_fn=seed_worker,
     )
 
-    # Check for existing checkpoint to resume (unless --force)
-    latest_ckpt = None if force else find_latest_checkpoint(run_name)
+    # Check for existing checkpoint to resume (always, to allow re-eval with --force)
+    latest_ckpt = find_latest_checkpoint(run_name)
     resume_epoch = 0
     if latest_ckpt is not None:
         print(f"Resuming from checkpoint: {latest_ckpt}")
@@ -543,7 +543,7 @@ def main():
                 continue
 
             try:
-                metrics = run_experiment(exp, seed, force=args.force)
+                metrics = run_experiment(exp, seed)
                 existing[seed_key] = {**exp, **metrics}
                 save_results(existing)
             except Exception as e:
