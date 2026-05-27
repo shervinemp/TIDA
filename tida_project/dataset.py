@@ -11,7 +11,7 @@ class TIDADataset(Dataset):
         self.pad_token_id = tokenizer.pad_token_id or 0
 
         if data_source == "wikitext":
-            raw = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+            raw = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
         elif os.path.isfile(data_source):
             ext = os.path.splitext(data_source)[1].lower()
             if ext in (".json", ".jsonl"):
