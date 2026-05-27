@@ -399,7 +399,7 @@ def run_experiment(exp: dict, seed: int, force: bool = False) -> dict:
         correct = 0
         from tqdm import tqdm
         with torch.no_grad():
-            lambada_ds = load_dataset("lambada", split="test")
+            lambada_ds = load_dataset("cimec/lambada", split="test")
             for item in tqdm(lambada_ds, desc="Lambada"):
                 text = item["text"]
                 enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=config.max_seq_len)
