@@ -252,7 +252,7 @@ def seed_worker(worker_id):
     random.seed(worker_id)
 
 
-def run_experiment(exp: dict, seed: int) -> dict:
+def run_experiment(exp: dict, seed: int, fresh: bool = False) -> dict:
     import torch
     import random
     import numpy as np
@@ -305,8 +305,8 @@ def run_experiment(exp: dict, seed: int) -> dict:
         worker_init_fn=seed_worker,
     )
 
-    # Check for existing checkpoint to resume (always, to allow re-eval with --force)
-    latest_ckpt = find_latest_checkpoint(run_name)
+    # Check for existing checkpoint to resume (unless --fresh)
+    latest_ckpt = None if fresh else find_latest_checkpoint(run_name)
     resume_epoch = 0
     if latest_ckpt is not None:
         print(f"Resuming from checkpoint: {latest_ckpt}")
@@ -499,7 +499,7 @@ def main():
     parser.add_argument("--name", help="Run only experiments containing this name")
     parser.add_argument("--list", action="store_true", help="List all available experiment names")
     parser.add_argument("--dry-run", action="store_true", help="Preview experiments")
-    parser.add_argument("--force", action="store_true", help="Re-run even if results exist")
+    parser.add_argument("--fresh", action="store_true", help="Train from scratch (ignore checkpoints)")
     parser.add_argument("--seeds", type=int, default=3, help="Number of seeds (default: 3)")
     args = parser.parse_args()
 
@@ -538,12 +538,8 @@ def main():
         for seed in range(args.seeds):
             seed_key = f"{name}_seed{seed}"
 
-            if seed_key in existing and existing[seed_key].get("status") == "completed" and not args.force:
-                print(f"Skipping {seed_key} (use --force to re-run)")
-                continue
-
             try:
-                metrics = run_experiment(exp, seed)
+                metrics = run_experiment(exp, seed, fresh=args.fresh)
                 existing[seed_key] = {**exp, **metrics}
                 save_results(existing)
             except Exception as e:
